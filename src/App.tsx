@@ -1,6 +1,12 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from "react";
+import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "./utils/cn";
+import {
+  signInAnon,
+  saveHabitState as saveToCloud,
+  subscribeToHabitState,
+  type StoredHabitState as CloudState,
+} from "./services/cloudSync";
 
 type Habit = {
   id: string;
@@ -15,6 +21,8 @@ type StoredHabitState = {
   habits: Habit[];
   logs: HabitLogs;
 };
+
+type SyncStatus = "connecting" | "syncing" | "synced" | "offline" | "error";
 
 type WeeklyPoint = {
   key: string;
@@ -285,12 +293,93 @@ export function App() {
   const [selectedColor, setSelectedColor] = useState(COLOR_OPTIONS[0]);
   const todayKey = useMemo(() => formatDateKey(clampDate(new Date())), []);
   const [selectedDateKey, setSelectedDateKey] = useState(todayKey);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>("connecting");
+  const uidRef = useRef<string | null>(null);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isRemoteUpdateRef = useRef(false);
+  const lastSavedJsonRef = useRef<string>("");
 
   const { habits, logs } = habitState;
 
+  // ── Cloud sync: authenticate & subscribe ──────────────────
   useEffect(() => {
+    let unsubscribeSnapshot: (() => void) | undefined;
+    let cancelled = false;
+
+    async function init() {
+      try {
+        const uid = await signInAnon();
+        if (cancelled) return;
+        uidRef.current = uid;
+
+        // Subscribe to real-time updates from Firestore
+        unsubscribeSnapshot = subscribeToHabitState(uid, (cloudState: CloudState | null) => {
+          if (cancelled) return;
+
+          if (cloudState) {
+            const cloudJson = JSON.stringify(cloudState);
+            // Only apply remote update if it differs from what we last saved
+            if (cloudJson !== lastSavedJsonRef.current) {
+              isRemoteUpdateRef.current = true;
+              setHabitState(cloudState);
+              window.localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudState));
+              lastSavedJsonRef.current = cloudJson;
+            }
+          }
+          setSyncStatus("synced");
+        });
+      } catch {
+        if (!cancelled) {
+          setSyncStatus("offline");
+        }
+      }
+    }
+
+    init();
+
+    return () => {
+      cancelled = true;
+      unsubscribeSnapshot?.();
+    };
+  }, []);
+
+  // ── Persist: save to localStorage immediately + debounced cloud save ──
+  const debouncedCloudSave = useCallback(
+    (state: StoredHabitState) => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+      }
+
+      saveTimerRef.current = setTimeout(async () => {
+        const uid = uidRef.current;
+        if (!uid) return;
+
+        try {
+          setSyncStatus("syncing");
+          const stateJson = JSON.stringify({ habits: state.habits, logs: state.logs });
+          lastSavedJsonRef.current = stateJson;
+          await saveToCloud(uid, state);
+          setSyncStatus("synced");
+        } catch {
+          setSyncStatus("error");
+        }
+      }, 800);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    // Always save to localStorage as offline cache
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(habitState));
-  }, [habitState]);
+
+    // Skip cloud save if this update came from the remote subscription
+    if (isRemoteUpdateRef.current) {
+      isRemoteUpdateRef.current = false;
+      return;
+    }
+
+    debouncedCloudSave(habitState);
+  }, [habitState, debouncedCloudSave]);
 
   const selectedDate = useMemo(() => getDateFromKey(selectedDateKey), [selectedDateKey]);
 
@@ -448,7 +537,35 @@ export function App() {
           <div className="grid gap-8 lg:grid-cols-[1.25fr_0.75fr] lg:items-center">
             <div className="space-y-6">
               <div className="space-y-3">
-                <p className="text-sm font-medium uppercase tracking-[0.3em] text-indigo-600">Stride</p>
+                <div className="flex items-center gap-3">
+                  <p className="text-sm font-medium uppercase tracking-[0.3em] text-indigo-600">Stride</p>
+                  <span
+                    className={cn(
+                      "inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium transition-all",
+                      syncStatus === "synced" && "bg-emerald-50 text-emerald-700",
+                      syncStatus === "syncing" && "bg-amber-50 text-amber-700",
+                      syncStatus === "connecting" && "bg-slate-100 text-slate-500",
+                      syncStatus === "offline" && "bg-slate-100 text-slate-400",
+                      syncStatus === "error" && "bg-red-50 text-red-600",
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        "size-1.5 rounded-full",
+                        syncStatus === "synced" && "bg-emerald-500",
+                        syncStatus === "syncing" && "animate-pulse bg-amber-500",
+                        syncStatus === "connecting" && "animate-pulse bg-slate-400",
+                        syncStatus === "offline" && "bg-slate-300",
+                        syncStatus === "error" && "bg-red-500",
+                      )}
+                    />
+                    {syncStatus === "synced" && "Cloud synced"}
+                    {syncStatus === "syncing" && "Syncing…"}
+                    {syncStatus === "connecting" && "Connecting…"}
+                    {syncStatus === "offline" && "Offline"}
+                    {syncStatus === "error" && "Sync error"}
+                  </span>
+                </div>
                 <h1 className="max-w-3xl text-4xl font-semibold tracking-tight text-slate-950 sm:text-5xl">
                   Habit tracking that keeps streaks, daily wins, and long-term patterns in one view.
                 </h1>
